@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The oldest version go.mod allows, and the current release.
+        go: ["1.25", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      # Not root, so the data-plane tests skip here; the ebpf job runs them.
+      - run: go test -race ./...
+
+  ebpf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # The libbpf headers are vendored in bpf/include; only clang and the
+      # kernel UAPI headers come from the system.
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm
+          [ -e /usr/include/asm ] || sudo ln -s "/usr/include/$(uname -m)-linux-gnu/asm" /usr/include/asm
+      - name: Compile the XDP program and regenerate bindings
+        run: go generate ./dataplane
+      # The .o differs between clang versions; the Go bindings must not.
+      - name: Generated Go bindings are up to date
+        run: git diff --exit-code -- dataplane/lb_bpfel.go
+      - name: Data-plane tests in the kernel (BPF_PROG_TEST_RUN, as root)
+        run: go test -exec sudo -race -count=1 -v ./dataplane
+      - name: End-to-end on veth, L2 mode
+        run: sudo env "PATH=$PATH" "HOME=$HOME" scripts/e2e.sh l2
+      - name: End-to-end on veth, IP-in-IP mode
+        run: sudo env "PATH=$PATH" "HOME=$HOME" scripts/e2e.sh ipip

@@ -1,0 +1,196 @@
+# maglev-xdp
+
+An L4 load balancer: Maglev consistent hashing ([Eisenbud et al., NSDI '16](https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud)) in a Go control plane, with an eBPF/XDP data plane that forwards packets inside the network driver.
+
+> **Status: phases 1 and 2 of 3 are done.**
+>
+> - **Tested in the kernel:** the XDP program forwards IPv4 TCP and UDP to backends chosen by the Maglev table, in L2 (MAC rewrite) or IP-in-IP mode. Connection tracking keeps established flows on their backend across a hot reload. Kernel unit tests cover this, along with an end-to-end run that sends real packets over virtual interfaces in Docker ([what was run](#what-was-run-and-what-wasnt)).
+> - **Not yet:** it has **not** run on a physical NIC or in native driver mode, and **nothing has been benchmarked**. The 10M+ packets/s per core figure is a target for phase 3, not a measurement.
+
+## What works and what doesn't
+
+| Piece | State |
+|---|---|
+| Maglev table population (Go), prime table size, 65537 by default | ✅ Works, tested, including the paper's worked example |
+| Backend add, remove and replace-all, with an atomic table swap | ✅ Works, tested under `-race` |
+| Disruption measurement (slots and simulated flows) | ✅ Works, [numbers below](#measured-disruption) |
+| XDP data plane in C (parse Ethernet/IPv4/TCP/UDP, hash, look up, forward) | ✅ Works in kernel tests and on veth interfaces |
+| Forwarding: L2 MAC rewrite (`XDP_TX`) and IP-in-IP encapsulation | ✅ Both modes, tested |
+| Go loader with cilium/ebpf: config, VIPs, backends, table writes, stats | ✅ Works |
+| Go and C pick the same backend | ✅ Checked over 5,000 random flows in the kernel |
+| Connection tracking (LRU map) | ✅ Established flows don't move when a backend is added; flows on a removed backend move |
+| `maglev-xdp` daemon with hot reload on SIGHUP | ✅ Works on veth (reload took about 2 ms for 4 backends) |
+| `maglev-stats` CLI | ✅ Works |
+| Native (driver) XDP on a physical NIC | ⏳ Not run. Only generic mode on veth (see below) |
+| Benchmarks against IPVS and HAProxy | ⏳ Phase 3. Nothing measured yet |
+| Health checks | ⏳ Not started. Backends only change when the file changes |
+| Weighted backends | ❌ Not implemented |
+| IPv6, IP options, IP fragments | ❌ Passed to the kernel untouched |
+
+## Quick start
+
+Requires Go 1.25 or newer (cilium/ebpf v0.22 needs it). So far it has only run on Go 1.26. Anything that touches XDP needs Linux and root. On macOS those targets run in Docker.
+
+```bash
+make test           # Go tests that run anywhere; the kernel tests skip off Linux
+make docker-test    # every test, including the XDP program in the kernel (privileged container)
+make e2e            # real packets over veth interfaces, in both forwarding modes
+make generate       # recompile bpf/lb.c and regenerate the Go bindings (needs clang; runs in Docker)
+```
+
+Running the load balancer on Linux, as root:
+
+```bash
+cat > backends.txt <<'EOF'
+# <backend IPv4> <next-hop MAC>
+10.0.0.11 02:00:00:00:00:11
+10.0.0.12 02:00:00:00:00:12
+EOF
+go run ./cmd/maglev-xdp -iface eth0 -vip 10.0.0.100:80/tcp -backends backends.txt               # L2 mode
+go run ./cmd/maglev-xdp -iface eth0 -vip 10.0.0.100:80/tcp -backends backends.txt \
+    -mode ipip -lb-addr 10.0.0.1                                                                 # IP-in-IP mode
+kill -HUP <pid>     # after editing backends.txt: rebuild the table and swap it in
+```
+
+Backends reply to clients directly (direct server return), so each backend needs the VIP configured locally: on its loopback interface in L2 mode, plus an IP-in-IP tunnel device in IP-in-IP mode. [`scripts/e2e.sh`](scripts/e2e.sh) sets up both.
+
+The table-only CLI from phase 1 still works anywhere:
+
+```bash
+go run ./cmd/maglev-stats -n 10 -fail be-03       # 10 backends, then fail one
+```
+
+## How it works
+
+### The Maglev table (Go, `maglev/`)
+
+Each backend gets a pseudo-random preference order over the `M` table slots, `(offset + j·skip) mod M`. Its `offset` and `skip` come from two hashes of the backend's name. The backends take turns claiming their most-preferred slot that is still free until the table is full. So every backend ends up with ⌊M/N⌋ or ⌈M/N⌉ slots, and a packet's backend is `table[hash(5-tuple) mod M]`.
+
+- **Same input, same table.** Backends are sorted before the build, and the name hash is fixed (FNV-1a plus a MurmurHash3 finaliser), so separate load-balancer instances with the same backends build identical tables. `TestGoldenTable` pins the output.
+- **Immutable tables.** `Build` returns a `Table` that never changes. `Pool` rebuilds on every change and swaps the new table in atomically.
+- **No permutation matrix.** The build keeps one cursor per backend, so extra memory is O(N), not O(N·M).
+
+### The data plane (C/eBPF, `bpf/lb.c`; Go loader, `dataplane/`)
+
+For each packet:
+
+1. **Skip what isn't ours.** Anything that isn't IPv4 TCP/UDP for a configured VIP (address, port, protocol) gets `XDP_PASS`, untouched. So do packets with IP options, fragments and truncated packets.
+2. **Pick a backend.** If the flow is in the connection-tracking map and its backend still exists, use that backend. Otherwise hash the 5-tuple with MurmurHash3 and read slot `hash mod M` of the VIP's table, giving a backend ID. Look up the backend and record the choice in connection tracking.
+3. **Forward with `XDP_TX`.**
+   - **L2 mode:** set the destination MAC to the backend's next hop, and the source MAC to the load balancer's.
+   - **IP-in-IP mode:** grow the packet by 20 bytes and write an outer IPv4 header (load balancer → backend, protocol 4, with checksum) in front of the original packet.
+
+| Map | Type | Contents |
+|---|---|---|
+| `vips` | hash, 16 entries | VIP → index of its table |
+| `tables` | array, 16 × M | the Maglev tables back to back; values are backend IDs (0 = none) |
+| `backends` | hash, 4096 entries | backend ID → address and next-hop MAC |
+| `conntrack` | LRU hash, 65536 entries | 5-tuple → backend ID |
+| `stats` | per-CPU array | rx, tx, pass, drops, conntrack hits and misses |
+
+**Hot reload.** The table size, mode and outer source address are constants set at load time. Everything else changes live. `Dataplane.SetVIP` writes the maps in an order that keeps every packet routable:
+
+1. Add the new backends.
+2. Overwrite the table. While this runs, packets see a mix of old and new slots, but every slot points at a live backend.
+3. Publish the VIP, if it's new.
+4. Delete the backends that left.
+
+Backend IDs are stable and never reused. So a backend that stays keeps its connection-tracking entries, and an entry pointing at a removed backend misses and gets a new backend.
+
+**Keeping Go and C in step.** `dataplane.FlowHash` is the Go version of the C hash. It is checked against published MurmurHash3 test vectors, and `TestDataplaneMatchesGo` checks in the kernel that both sides choose the same backend.
+
+## What was run and what wasn't
+
+Run, all passing:
+
+- **On macOS (Go 1.26.3):** `go test -race ./...`. This covers the Maglev table, the CLI and the flow hash. The kernel tests skip here.
+- **In Docker Desktop's Linux VM** (kernel 6.12.65-linuxkit, arm64, privileged container): `make docker-test`, every test under `-race`. That includes the XDP program running inside the kernel on hand-built packets (`BPF_PROG_TEST_RUN`), which checks:
+  - pass-through for non-VIP, ARP, IPv6, ICMP, IP options, fragments and truncated packets;
+  - exact output bytes in both forwarding modes, including the outer IPv4 checksum;
+  - 5,000 random flows choosing the backend Go predicts;
+  - connection tracking: when a 6th backend is added, the table alone would move 511 of 3,000 established flows, and with connection tracking 0 moved;
+  - dropping traffic for a VIP with no backends, deleting a VIP, and keeping separate VIP tables apart.
+- **`make e2e` in the same VM.** The client, load balancer and three backends each sit in their own network namespace on a Linux bridge, with `maglev-xdp` attached to the load balancer's veth in **generic** XDP mode. The client sends 300 UDP flows, then the backends file gets a fourth backend and the daemon gets a SIGHUP. Then it re-sends the 300 flows, followed by 300 new ones. Results, for both L2 and IP-in-IP:
+  - all 900 datagrams arrived in a backend's socket, each on the backend Go predicted;
+  - the XDP counters read `tx=900`;
+  - the new table alone would have moved 65 of the 300 established flows, and none moved;
+  - be4 got 73 of the 300 new flows;
+  - in IP-in-IP mode, the backends' tunnel devices decapsulated all 900 packets.
+
+Not run:
+
+- **Native (driver-mode) XDP and physical NICs.** The end-to-end test uses generic XDP on veth, which runs the same program but in the kernel's slower generic path. Real performance needs real NICs.
+- **x86-64.** Everything ran on arm64. The CI workflow runs the kernel tests and both end-to-end modes on x86-64 GitHub runners, but it has never run because the repo isn't on GitHub yet.
+- **TCP end to end.** The kernel unit tests cover TCP; the veth test only sends UDP.
+- **Any throughput or latency measurement.** That's phase 3.
+
+## Known limitations
+
+- IPv4 only. IP options and fragments go to the kernel, as does ICMP for a VIP, including "fragmentation needed" messages.
+- IP-in-IP adds 20 bytes, so the path from the load balancer to the backends needs an MTU 20 bytes larger than the client side.
+- The connection-tracking map is one shared LRU hash. It has no idle timeout and is shared by all CPUs. Katran uses per-CPU maps to avoid contention; phase 3 will show whether this matters.
+- Capacity is fixed at compile time: 16 VIPs, 4,096 backends and 65,536 tracked flows.
+- If `SetVIP` fails halfway (say, a full map), the maps can be partly updated. Calling it again with the same arguments repairs them.
+- Connection tracking is per instance. Several load balancers behind ECMP wouldn't share it; the paper's answer is the consistent hash itself.
+
+## Measured disruption
+
+When one of `N` backends fails, an ideal consistent hash moves only that backend's slots, a share of `1/N`. Maglev also moves a few slots between backends that stayed up (*extra*). That is the price of its near-perfect balance.
+
+From `go test -v -run Disruption ./maglev`. Each row fails every backend in turn, or an even sample of 20 when N > 20. *Ratio* is the worst share remapped divided by `1/N`, so 1.00 is ideal.
+
+| M (table size) | N | ideal 1/N | mean remapped | worst remapped | worst ratio | worst extra |
+|---:|---:|---:|---:|---:|---:|---:|
+| 65,537 | 3 | 33.33% | 33.35% | 33.35% | 1.001 | 0.02% |
+| 65,537 | 5 | 20.00% | 20.09% | 20.11% | 1.006 | 0.11% |
+| 65,537 | 10 | 10.00% | 10.24% | 10.31% | 1.031 | 0.31% |
+| 65,537 | 20 | 5.00% | 5.31% | 5.36% | 1.071 | 0.36% |
+| 65,537 | 50 | 2.00% | 2.45% | 2.50% | 1.251 | 0.50% |
+| 65,537 | 100 | 1.00% | 1.57% | 1.61% | 1.610 | 0.61% |
+| 655,373 | 10 | 10.00% | 10.05% | 10.06% | 1.006 | 0.06% |
+| 655,373 | 100 | 1.00% | 1.14% | 1.15% | 1.146 | 0.15% |
+
+With a million random flow hashes, N=10 and one backend failing, 10.19% of flows changed backend, against 10.20% of slots. Naive `hash mod N` selection moved 89.97% of them.
+
+- **"About 1/N of flows remapped" holds for small pools.** With 10 backends, a failure moves 10.2–10.3% of flows instead of 10%.
+- **For large pools it holds less tightly.** The extra churn stays under 1% of the table, but `1/N` shrinks as N grows. At N=100 a failure remaps 1.6% of flows instead of 1%, and a 10× larger table (655,373) brings that down to 1.15%. This matches the paper (§5.3).
+- **Connection tracking is what protects established flows.** Without it, the extra flows (0.2% at N=10) would switch backend mid-connection. The paper uses connection tracking as "the primary means of protection" for the same reason. In this project, the kernel tests and the end-to-end run both show established flows staying on their backend when the table changes.
+
+## Table build speed
+
+From `go test -run '^$' -bench . ./maglev` on an Apple M4 Pro, Go 1.26:
+
+| M | N | build time |
+|---:|---:|---:|
+| 65,537 | 10 | 0.98 ms |
+| 65,537 | 100 | 1.43 ms |
+| 65,537 | 1,000 | 1.60 ms |
+| 655,373 | 100 | 16.9 ms |
+| 655,373 | 1,000 | 19.6 ms |
+
+A Go-side lookup takes about 1.1 ns. The paper reports 1.8 ms and 22.9 ms to generate the two table sizes on its own hardware, so the numbers aren't directly comparable.
+
+## Layout
+
+```text
+maglev/              Maglev table, Pool (add/remove/swap), hashing, disruption tests, benchmarks
+bpf/lb.c             the XDP program
+bpf/include/bpf/     libbpf helper headers (vendored, LGPL-2.1 OR BSD-2-Clause)
+dataplane/           Go loader (cilium/ebpf), flow hash, kernel tests
+  lb_bpfel.go/.o     generated by bpf2go from bpf/lb.c (committed; `make generate` rebuilds)
+cmd/maglev-xdp/      the load-balancer daemon (attach, hot reload on SIGHUP, stats)
+cmd/maglev-stats/    table statistics CLI
+scripts/e2e.sh       namespace/veth/bridge end-to-end test (+ scripts/e2e/udp.go helper)
+docker/Dockerfile    Linux build/test image: clang 19 + Go 1.26 + iproute2
+.github/workflows/   CI: Go tests on 1.25 and stable; clang build, kernel tests and e2e as root (never run yet)
+```
+
+## Roadmap
+
+1. **Control plane and Maglev table (Go).** ✅
+2. **XDP data plane (C/eBPF), loader, connection tracking, hot reload.** ✅
+3. **Benchmarks.** Packets per second and latency against IPVS and HAProxy on the same hardware, with pktgen or TRex, on real NICs in native XDP mode. Likely follow-ups depending on results: per-CPU connection tracking, health checks.
+
+## License
+
+None chosen yet. The kernel requires a license string in the BPF object, so `bpf/lb.c` declares `Dual MIT/GPL` as a placeholder. Change it when you pick a license. The vendored libbpf headers keep their own license (LGPL-2.1 OR BSD-2-Clause, with `bpf/include/bpf/LICENSE.BSD-2-Clause`).

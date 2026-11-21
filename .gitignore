@@ -1,0 +1,13 @@
+# Go
+/maglev-stats
+/bin/
+*.test
+*.out
+*.prof
+
+# Object files, except the compiled XDP program that bpf2go embeds in the Go
+# binary (committed so the Go code builds without clang)
+*.o
+!dataplane/lb_bpfel.o
+
+.DS_Store
