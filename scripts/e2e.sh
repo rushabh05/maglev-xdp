@@ -113,10 +113,17 @@ LB_ARGS=(-iface lb-v -vip "$VIP:$PORT/udp" -backends "$WORK/backends.txt" -mode 
 
 # start_lb [extra flags]: run maglev-xdp in the lb namespace.
 start_lb() {
+	# Empty the log first: the background redirect truncates it only once that
+	# process runs, so a restart could otherwise match the previous run's line.
+	: >"$WORK/lb.log"
 	ip netns exec lb "$WORK/maglev-xdp" "${LB_ARGS[@]}" "$@" >"$WORK/lb.log" 2>&1 &
 	LB_PID=$!
 	PIDS+=("$LB_PID")
-	for _ in $(seq 50); do grep -q balancing "$WORK/lb.log" 2>/dev/null && break; sleep 0.1; done
+	for _ in $(seq 50); do
+		grep -q balancing "$WORK/lb.log" 2>/dev/null && break
+		kill -0 "$LB_PID" 2>/dev/null || break # exited: report it below
+		sleep 0.1
+	done
 	grep -q balancing "$WORK/lb.log" || fail "maglev-xdp did not start"
 	grep -E 'balancing|sketch: count-min' "$WORK/lb.log" | sed 's/^/  /'
 }
