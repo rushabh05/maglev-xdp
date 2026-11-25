@@ -4,7 +4,7 @@ An L4 load balancer: Maglev consistent hashing ([Eisenbud et al., NSDI '16](http
 
 > **Status: phases 1 and 2 of 3 are done.**
 >
-> - **Tested in the kernel:** the XDP program forwards IPv4 TCP and UDP to backends chosen by the Maglev table, in L2 (MAC rewrite) or IP-in-IP mode. Connection tracking keeps established flows on their backend across a hot reload. Kernel unit tests cover this, along with an end-to-end run that sends real packets over virtual interfaces in Docker ([what was run](#what-was-run-and-what-wasnt)).
+> - **Tested in the kernel:** the XDP program forwards IPv4 TCP and UDP to backends chosen by the Maglev table, in L2 (MAC rewrite) or IP-in-IP mode. Connection tracking keeps established flows on their backend across a hot reload. Kernel unit tests cover this, along with an end-to-end run that sends real packets over virtual interfaces. Both run on arm64 in Docker and on x86-64 in CI ([what was run](#what-was-run-and-what-wasnt)).
 > - **Not yet:** it has **not** run on a physical NIC or in native driver mode, and **nothing has been benchmarked**. The 10M+ packets/s per core figure is a target for phase 3, not a measurement.
 
 ## What works and what doesn't
@@ -29,7 +29,7 @@ An L4 load balancer: Maglev consistent hashing ([Eisenbud et al., NSDI '16](http
 
 ## Quick start
 
-Requires Go 1.25 or newer (cilium/ebpf v0.22 needs it). So far it has only run on Go 1.26. Anything that touches XDP needs Linux and root. On macOS those targets run in Docker.
+Requires Go 1.25 or newer (cilium/ebpf v0.22 needs it). CI tests Go 1.25 and the current release. Anything that touches XDP needs Linux and root. On macOS those targets run in Docker.
 
 ```bash
 make test           # Go tests that run anywhere; the kernel tests skip off Linux
@@ -116,11 +116,16 @@ Run, all passing:
   - the new table alone would have moved 65 of the 300 established flows, and none moved;
   - be4 got 73 of the 300 new flows;
   - in IP-in-IP mode, the backends' tunnel devices decapsulated all 900 packets.
+- **GitHub Actions** (`ubuntu-latest`, x86-64), on every push:
+  - gofmt, vet and `go test -race` on Go 1.25 and the current release;
+  - the XDP program rebuilt with Ubuntu's clang, with a check that the generated Go bindings match the committed ones;
+  - the kernel tests and both end-to-end modes as root.
+
+  The first run gave the same results as on arm64: all 5,000 flows matched Go, 0 of 511 established flows moved, and `tx=900` in both modes, with 900 packets decapsulated in IP-in-IP mode.
 
 Not run:
 
 - **Native (driver-mode) XDP and physical NICs.** The end-to-end test uses generic XDP on veth, which runs the same program but in the kernel's slower generic path. Real performance needs real NICs.
-- **x86-64.** Everything ran on arm64. The CI workflow runs the kernel tests and both end-to-end modes on x86-64 GitHub runners, but it has never run because the repo isn't on GitHub yet.
 - **TCP end to end.** The kernel unit tests cover TCP; the veth test only sends UDP.
 - **Any throughput or latency measurement.** That's phase 3.
 
@@ -182,7 +187,7 @@ cmd/maglev-xdp/      the load-balancer daemon (attach, hot reload on SIGHUP, sta
 cmd/maglev-stats/    table statistics CLI
 scripts/e2e.sh       namespace/veth/bridge end-to-end test (+ scripts/e2e/udp.go helper)
 docker/Dockerfile    Linux build/test image: clang 19 + Go 1.26 + iproute2
-.github/workflows/   CI: Go tests on 1.25 and stable; clang build, kernel tests and e2e as root (never run yet)
+.github/workflows/   CI: Go tests on 1.25 and stable; clang build, kernel tests and e2e as root
 ```
 
 ## Roadmap
