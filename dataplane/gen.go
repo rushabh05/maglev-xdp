@@ -6,4 +6,4 @@ package dataplane
 // vendored in bpf/include), so run it on Linux: `make generate` does it in
 // the Docker image. The generated files are committed so the Go code builds
 // without clang.
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel -type stat -type vip_key -type vip_info -type backend -type flow lb ../bpf/lb.c -- -I../bpf/include -O2 -g -Wall -Werror
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel -type stat -type sketch_params -type sketch_config -type heavy_entry -type hll_registers -type vip_key -type vip_info -type backend -type flow lb ../bpf/lb.c -- -I../bpf/include -O2 -g -Wall -Werror

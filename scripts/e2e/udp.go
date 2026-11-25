@@ -2,8 +2,9 @@
 
 // Helper for scripts/e2e.sh.
 //
-//	udp listen  -addr 10.0.0.100:5353                 print the source port of each datagram
+//	udp listen  -addr 10.0.0.100:5353                 print "<source ip> <source port>" per datagram
 //	udp send    -to 10.0.0.100:5353 -ports 40000-40099 one datagram from each source port
+//	            [-from 10.0.0.50] [-rate 1000]          from a given address, at most -rate per second
 //	udp predict -vip 10.0.0.100:5353 -src 10.0.0.2 -ports 40000-40099 -backends file
 //	                                                  print "<port> <backend>" as Go expects the data plane to choose
 package main
@@ -18,6 +19,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rushabh05/maglev-xdp/dataplane"
 	"github.com/rushabh05/maglev-xdp/maglev"
@@ -35,6 +37,8 @@ func main() {
 	ports := fs.String("ports", "", "source port range, e.g. 40000-40099")
 	backends := fs.String("backends", "", "backends file")
 	size := fs.Int("size", maglev.DefaultSize, "Maglev table size")
+	from := fs.String("from", "", "source address for send")
+	rate := fs.Int("rate", 0, "datagrams per second for send (0: as fast as possible)")
 	fs.Parse(os.Args[2:])
 
 	switch os.Args[1] {
@@ -49,13 +53,22 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			fmt.Println(from.(*net.UDPAddr).Port)
+			ua := from.(*net.UDPAddr)
+			fmt.Println(ua.IP, ua.Port)
 		}
 	case "send":
 		dst := net.UDPAddrFromAddrPort(netip.MustParseAddrPort(*to))
+		var srcIP net.IP
+		if *from != "" {
+			srcIP = net.ParseIP(*from)
+		}
 		lo, hi := portRange(*ports)
+		start := time.Now()
 		for p := lo; p <= hi; p++ {
-			conn, err := net.DialUDP("udp4", &net.UDPAddr{Port: p}, dst)
+			if *rate > 0 {
+				time.Sleep(time.Until(start.Add(time.Duration(p-lo) * time.Second / time.Duration(*rate))))
+			}
+			conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: srcIP, Port: p}, dst)
 			if err != nil {
 				log.Fatal(err)
 			}

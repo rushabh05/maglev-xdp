@@ -30,6 +30,38 @@ type lbFlow struct {
 	Pad   [3]uint8
 }
 
+type lbHeavyEntry struct {
+	_         structs.HostLayout
+	Estimate  uint64
+	Epoch     uint32
+	Confirmed uint32
+}
+
+type lbHllRegisters struct {
+	_   structs.HostLayout
+	Reg [16384]uint8
+}
+
+type lbSketchConfig struct {
+	_         structs.HostLayout
+	Epoch     uint32
+	DropHeavy uint32
+	PhiPpm    uint32
+	Pad       uint32
+	MinCount  uint64
+}
+
+type lbSketchParams uint32
+
+const (
+	lbSketchParamsCM_DEPTH      lbSketchParams = 5
+	lbSketchParamsCM_LOG_WIDTH  lbSketchParams = 12
+	lbSketchParamsCM_WIDTH      lbSketchParams = 4096
+	lbSketchParamsHLL_P         lbSketchParams = 14
+	lbSketchParamsHLL_REGISTERS lbSketchParams = 16384
+	lbSketchParamsHEAVY_ENTRIES lbSketchParams = 1024
+)
+
 type lbStat uint32
 
 const (
@@ -40,7 +72,8 @@ const (
 	lbStatSTAT_DROP_ERROR      lbStat = 4
 	lbStatSTAT_CT_HIT          lbStat = 5
 	lbStatSTAT_CT_MISS         lbStat = 6
-	lbStatSTAT_MAX             lbStat = 7
+	lbStatSTAT_DROP_HEAVY      lbStat = 7
+	lbStatSTAT_MAX             lbStat = 8
 )
 
 type lbVipInfo struct {
@@ -60,16 +93,26 @@ type lbVipKey struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	lbMapBackends   = "backends"
-	lbMapConntrack  = "conntrack"
-	lbMapStats      = "stats"
-	lbMapTables     = "tables"
-	lbMapVips       = "vips"
-	lbProgXdpLb     = "xdp_lb"
-	lbVarLbAddr     = "lb_addr"
-	lbVarMode       = "mode"
-	lbVarTableSize  = "table_size"
-	lbVarUnusedStat = "unused_stat"
+	lbMapBackends           = "backends"
+	lbMapCm                 = "cm"
+	lbMapCmTotal            = "cm_total"
+	lbMapConntrack          = "conntrack"
+	lbMapHeavy              = "heavy"
+	lbMapHll                = "hll"
+	lbMapSketchCfg          = "sketch_cfg"
+	lbMapStats              = "stats"
+	lbMapTables             = "tables"
+	lbMapVips               = "vips"
+	lbProgXdpLb             = "xdp_lb"
+	lbVarCmA                = "cm_a"
+	lbVarCmB                = "cm_b"
+	lbVarHllSeed            = "hll_seed"
+	lbVarLbAddr             = "lb_addr"
+	lbVarMode               = "mode"
+	lbVarSketchEnabled      = "sketch_enabled"
+	lbVarTableSize          = "table_size"
+	lbVarUnusedSketchParams = "unused_sketch_params"
+	lbVarUnusedStat         = "unused_stat"
 )
 
 // loadLb returns the embedded CollectionSpec for lb.
@@ -122,7 +165,12 @@ type lbProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type lbMapSpecs struct {
 	Backends  *ebpf.MapSpec `ebpf:"backends"`
+	Cm        *ebpf.MapSpec `ebpf:"cm"`
+	CmTotal   *ebpf.MapSpec `ebpf:"cm_total"`
 	Conntrack *ebpf.MapSpec `ebpf:"conntrack"`
+	Heavy     *ebpf.MapSpec `ebpf:"heavy"`
+	Hll       *ebpf.MapSpec `ebpf:"hll"`
+	SketchCfg *ebpf.MapSpec `ebpf:"sketch_cfg"`
 	Stats     *ebpf.MapSpec `ebpf:"stats"`
 	Tables    *ebpf.MapSpec `ebpf:"tables"`
 	Vips      *ebpf.MapSpec `ebpf:"vips"`
@@ -132,10 +180,15 @@ type lbMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type lbVariableSpecs struct {
-	LbAddr     *ebpf.VariableSpec `ebpf:"lb_addr"`
-	Mode       *ebpf.VariableSpec `ebpf:"mode"`
-	TableSize  *ebpf.VariableSpec `ebpf:"table_size"`
-	UnusedStat *ebpf.VariableSpec `ebpf:"unused_stat"`
+	CmA                *ebpf.VariableSpec `ebpf:"cm_a"`
+	CmB                *ebpf.VariableSpec `ebpf:"cm_b"`
+	HllSeed            *ebpf.VariableSpec `ebpf:"hll_seed"`
+	LbAddr             *ebpf.VariableSpec `ebpf:"lb_addr"`
+	Mode               *ebpf.VariableSpec `ebpf:"mode"`
+	SketchEnabled      *ebpf.VariableSpec `ebpf:"sketch_enabled"`
+	TableSize          *ebpf.VariableSpec `ebpf:"table_size"`
+	UnusedSketchParams *ebpf.VariableSpec `ebpf:"unused_sketch_params"`
+	UnusedStat         *ebpf.VariableSpec `ebpf:"unused_stat"`
 }
 
 // lbObjects contains all objects after they have been loaded into the kernel.
@@ -159,7 +212,12 @@ func (o *lbObjects) Close() error {
 // It can be passed to loadLbObjects or ebpf.CollectionSpec.LoadAndAssign.
 type lbMaps struct {
 	Backends  *ebpf.Map `ebpf:"backends"`
+	Cm        *ebpf.Map `ebpf:"cm"`
+	CmTotal   *ebpf.Map `ebpf:"cm_total"`
 	Conntrack *ebpf.Map `ebpf:"conntrack"`
+	Heavy     *ebpf.Map `ebpf:"heavy"`
+	Hll       *ebpf.Map `ebpf:"hll"`
+	SketchCfg *ebpf.Map `ebpf:"sketch_cfg"`
 	Stats     *ebpf.Map `ebpf:"stats"`
 	Tables    *ebpf.Map `ebpf:"tables"`
 	Vips      *ebpf.Map `ebpf:"vips"`
@@ -168,7 +226,12 @@ type lbMaps struct {
 func (m *lbMaps) Close() error {
 	return _LbClose(
 		m.Backends,
+		m.Cm,
+		m.CmTotal,
 		m.Conntrack,
+		m.Heavy,
+		m.Hll,
+		m.SketchCfg,
 		m.Stats,
 		m.Tables,
 		m.Vips,
@@ -179,10 +242,15 @@ func (m *lbMaps) Close() error {
 //
 // It can be passed to loadLbObjects or ebpf.CollectionSpec.LoadAndAssign.
 type lbVariables struct {
-	LbAddr     *ebpf.Variable `ebpf:"lb_addr"`
-	Mode       *ebpf.Variable `ebpf:"mode"`
-	TableSize  *ebpf.Variable `ebpf:"table_size"`
-	UnusedStat *ebpf.Variable `ebpf:"unused_stat"`
+	CmA                *ebpf.Variable `ebpf:"cm_a"`
+	CmB                *ebpf.Variable `ebpf:"cm_b"`
+	HllSeed            *ebpf.Variable `ebpf:"hll_seed"`
+	LbAddr             *ebpf.Variable `ebpf:"lb_addr"`
+	Mode               *ebpf.Variable `ebpf:"mode"`
+	SketchEnabled      *ebpf.Variable `ebpf:"sketch_enabled"`
+	TableSize          *ebpf.Variable `ebpf:"table_size"`
+	UnusedSketchParams *ebpf.Variable `ebpf:"unused_sketch_params"`
+	UnusedStat         *ebpf.Variable `ebpf:"unused_stat"`
 }
 
 // lbPrograms contains all programs after they have been loaded into the kernel.

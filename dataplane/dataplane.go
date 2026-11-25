@@ -51,6 +51,9 @@ type Config struct {
 	Mode      Mode
 	// LBAddr is the outer source address in ModeIPIP.
 	LBAddr netip.Addr
+	// Sketch configures the traffic sketches; the zero value enables them
+	// with default thresholds and random seeds.
+	Sketch SketchConfig
 }
 
 // VIP is a virtual service: traffic to Addr:Port over Proto is balanced.
@@ -72,7 +75,7 @@ type Backend struct {
 
 // Stats are packet counters summed over all CPUs.
 type Stats struct {
-	RX, Pass, TX, DropNoBackend, DropError, ConntrackHit, ConntrackMiss uint64
+	RX, Pass, TX, DropNoBackend, DropError, ConntrackHit, ConntrackMiss, DropHeavy uint64
 }
 
 var (
@@ -88,6 +91,7 @@ type Dataplane struct {
 	maxVIPs int
 	vips    map[VIP]*vipState
 	nextID  uint32 // backend IDs are never reused; 0 means "none"
+	sk      sketchState
 }
 
 type vipState struct {
@@ -112,6 +116,10 @@ func Load(cfg Config) (*Dataplane, error) {
 	if cfg.Mode == ModeIPIP && !cfg.LBAddr.Is4() {
 		return nil, fmt.Errorf("dataplane: IP-in-IP mode needs an IPv4 LBAddr, got %v", cfg.LBAddr)
 	}
+	sk, err := newSketchState(cfg.Sketch)
+	if err != nil {
+		return nil, err
+	}
 	// Only needed on kernels before 5.11, which charge BPF memory to
 	// RLIMIT_MEMLOCK.
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -123,22 +131,29 @@ func Load(cfg Config) (*Dataplane, error) {
 		return nil, err
 	}
 	maxVIPs := int(spec.Maps["vips"].MaxEntries)
+	if maxVIPs != maxVIPsC || int(spec.Maps["hll"].MaxEntries) != 2*maxVIPsC {
+		return nil, fmt.Errorf("dataplane: MAX_VIPS in bpf/lb.c changed; update maxVIPsC")
+	}
 	spec.Maps["tables"].MaxEntries = uint32(maxVIPs * size)
 	var lbAddr [4]byte
 	if cfg.Mode == ModeIPIP {
 		lbAddr = cfg.LBAddr.As4()
 	}
 	for name, v := range map[string]any{
-		"table_size": uint32(size),
-		"mode":       uint32(cfg.Mode),
-		"lb_addr":    lbAddr,
+		"table_size":     uint32(size),
+		"mode":           uint32(cfg.Mode),
+		"lb_addr":        lbAddr,
+		"sketch_enabled": boolToU32(!cfg.Sketch.Disabled),
+		"cm_a":           sk.seeds.CMA,
+		"cm_b":           sk.seeds.CMB,
+		"hll_seed":       sk.seeds.HLL,
 	} {
 		if err := spec.Variables[name].Set(v); err != nil {
 			return nil, fmt.Errorf("dataplane: setting %s: %w", name, err)
 		}
 	}
 
-	d := &Dataplane{size: size, maxVIPs: maxVIPs, vips: make(map[VIP]*vipState)}
+	d := &Dataplane{size: size, maxVIPs: maxVIPs, vips: make(map[VIP]*vipState), sk: sk}
 	if err := spec.LoadAndAssign(&d.objs, nil); err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
@@ -146,7 +161,18 @@ func Load(cfg Config) (*Dataplane, error) {
 		}
 		return nil, fmt.Errorf("dataplane: loading: %w", err)
 	}
+	if err := d.writeSketchConfig(); err != nil {
+		d.Close()
+		return nil, err
+	}
 	return d, nil
+}
+
+func boolToU32(b bool) uint32 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // Close unloads the program and its maps. Links created by Attach must be
@@ -319,6 +345,7 @@ func (d *Dataplane) Stats() (Stats, error) {
 		lbStatSTAT_DROP_ERROR:      &s.DropError,
 		lbStatSTAT_CT_HIT:          &s.ConntrackHit,
 		lbStatSTAT_CT_MISS:         &s.ConntrackMiss,
+		lbStatSTAT_DROP_HEAVY:      &s.DropHeavy,
 	} {
 		var perCPU []uint64
 		if err := d.objs.Stats.Lookup(uint32(stat), &perCPU); err != nil {

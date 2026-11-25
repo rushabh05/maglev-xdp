@@ -13,6 +13,11 @@
 # hot-reloads a fourth backend (SIGHUP) and checks that established flows stay
 # put while new flows follow the new table.
 #
+# Then a flood: 30 normal sources and one flooder send at the same time. With
+# the traffic sketches the daemon must report the flooder as a heavy hitter
+# and no normal source; restarted with -drop-heavy it must drop the flood once
+# confirmed while every normal datagram still reaches a backend.
+#
 # Usage (as root on Linux, or via `make e2e`): scripts/e2e.sh [l2|ipip]
 #
 # Limits: veth interfaces only support generic (SKB) XDP for XDP_TX here, so
@@ -102,21 +107,31 @@ for b in "${BACKENDS[@]}"; do
 done
 backend $NEW_BACKEND # up from the start, but not in the pool yet
 
-step "start maglev-xdp on lb-v"
-ip netns exec lb "$WORK/maglev-xdp" -iface lb-v -vip "$VIP:$PORT/udp" -backends "$WORK/backends.txt" \
-	-mode "$MODE" -lb-addr "$LB_IP" -xdp-mode generic -stats 200ms >"$WORK/lb.log" 2>&1 &
-LB_PID=$!
-PIDS+=("$LB_PID")
-for _ in $(seq 50); do grep -q balancing "$WORK/lb.log" 2>/dev/null && break; sleep 0.1; done
-grep -q balancing "$WORK/lb.log" || fail "maglev-xdp did not start"
-grep balancing "$WORK/lb.log" | sed 's/^/  /'
+# Heavy hitter here: at least 10% of a 1 s window's packets and at least 300.
+LB_ARGS=(-iface lb-v -vip "$VIP:$PORT/udp" -backends "$WORK/backends.txt" -mode "$MODE" -lb-addr "$LB_IP"
+	-xdp-mode generic -stats 200ms -window 1s -hh-phi 0.1 -hh-min 300)
 
-# received <ports-range-label>: "<port> <backend ip>" for every datagram the
-# backends received, sorted.
+# start_lb [extra flags]: run maglev-xdp in the lb namespace.
+start_lb() {
+	ip netns exec lb "$WORK/maglev-xdp" "${LB_ARGS[@]}" "$@" >"$WORK/lb.log" 2>&1 &
+	LB_PID=$!
+	PIDS+=("$LB_PID")
+	for _ in $(seq 50); do grep -q balancing "$WORK/lb.log" 2>/dev/null && break; sleep 0.1; done
+	grep -q balancing "$WORK/lb.log" || fail "maglev-xdp did not start"
+	grep -E 'balancing|sketch: count-min' "$WORK/lb.log" | sed 's/^/  /'
+}
+
+step "start maglev-xdp on lb-v"
+start_lb
+
+# received: "<port> <backend ip>" for every datagram the backends received
+# from the main client, sorted.
 received() {
 	for b in "${BACKENDS[@]}" "$NEW_BACKEND"; do
 		set -- $b
-		if [ -s "$WORK/$1.ports" ]; then sed "s/\$/ $2/" "$WORK/$1.ports"; fi
+		if [ -s "$WORK/$1.ports" ]; then
+			awk -v ip="$CLIENT_IP" -v be="$2" '$1 == ip { print $2, be }' "$WORK/$1.ports"
+		fi
 	done | sort -n
 }
 
@@ -197,5 +212,68 @@ if [ "$MODE" = ipip ]; then
 	echo "  packets decapsulated by the backends' IP-in-IP devices: $decap"
 	[ "$decap" -ge 900 ] || fail "backends decapsulated $decap packets, want at least 900"
 fi
+
+step "flood setup: 30 normal sources, one flooder"
+FLOODER=10.0.0.250
+NORMAL_IPS=()
+for i in $(seq 50 79); do NORMAL_IPS+=("10.0.0.$i"); done
+for ip in "${NORMAL_IPS[@]}" "$FLOODER"; do ip -n client addr add "$ip/24" dev client-v; done
+
+# from <ip>: datagrams the backends received from ip.
+from() { cat "$WORK"/be*.ports | awk -v ip="$1" '$1 == ip' | wc -l; }
+
+# flood_round: over about 3 s, the flooder sends 3000 datagrams and each
+# normal source 20, all at once.
+flood_round() {
+	clear_received
+	local pids=()
+	ip netns exec client "$WORK/udp" send -to "$VIP:$PORT" -from "$FLOODER" -ports 20000-22999 -rate 1000 &
+	pids+=($!)
+	for ip in "${NORMAL_IPS[@]}"; do
+		ip netns exec client "$WORK/udp" send -to "$VIP:$PORT" -from "$ip" -ports 50000-50019 -rate 7 &
+		pids+=($!)
+	done
+	wait "${pids[@]}"
+	sleep 0.5 # let the last datagrams arrive
+}
+
+# heavy_lines: the daemon's per-window sketch reports that list a heavy hitter.
+heavy_lines() { grep 'sketch: window' "$WORK/lb.log" | grep -v 'heavy: none' || true; }
+
+check_normal() {
+	local got=0
+	for ip in "${NORMAL_IPS[@]}"; do got=$((got + $(from "$ip"))); done
+	echo "  normal sources: $got of 600 datagrams reached a backend"
+	[ "$got" -eq 600 ] || fail "normal traffic lost: $got of 600"
+	if heavy_lines | grep -Eq ' 10\.0\.0\.(5[0-9]|6[0-9]|7[0-9]) ≈'; then
+		heavy_lines | sed 's/^/  /'
+		fail "a normal source was reported as a heavy hitter"
+	fi
+}
+
+wait_for_flooder_report() {
+	for _ in $(seq 30); do heavy_lines | grep -q " $FLOODER ≈" && break; sleep 0.1; done
+	heavy_lines | grep " $FLOODER ≈" | tail -2 | sed 's/^.*sketch: /  sketch: /'
+	heavy_lines | grep -q " $FLOODER ≈" || fail "flooder never reported as a heavy hitter"
+}
+
+step "flood, detection only"
+flood_round
+echo "  flooder: $(from "$FLOODER") of 3000 datagrams reached a backend"
+wait_for_flooder_report
+check_normal
+
+step "flood, with -drop-heavy"
+kill -TERM "$LB_PID"
+wait "$LB_PID" 2>/dev/null || true
+start_lb -drop-heavy
+flood_round
+wait_for_flooder_report
+check_normal
+got=$(from "$FLOODER")
+dropped=$(grep 'rx=' "$WORK/lb.log" | tail -1 | sed 's/.*drop_heavy=\([0-9]*\).*/\1/')
+echo "  flooder: $got of 3000 datagrams reached a backend; XDP dropped $dropped (drop_heavy)"
+[ "$dropped" -ge 500 ] || fail "only $dropped flood packets dropped"
+[ "$got" -le 2500 ] || fail "$got of 3000 flood packets got through"
 
 step "PASS ($MODE mode)"
