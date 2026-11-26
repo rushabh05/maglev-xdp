@@ -174,14 +174,24 @@ type WindowReport struct {
 	Bound    uint64 // ⌊εN⌋
 	Distinct []Distinct
 	Heavy    []HeavyHitter // descending by estimate
+	Flagged  int           // kernel candidates judged against this window
+	Pending  int           // of those, not heavy here but flagged again in the new window: kept, not dropped
 }
 
 // RotateWindow closes the current window and returns its report. It
 // switches the kernel to the other buffer, waits grace for programs already
 // running on the old buffer to finish (they take microseconds), then merges
-// the closed buffer across CPUs, confirms the flagged sources against it,
-// removes the ones that aren't heavy over the whole window, and clears the
-// buffer for reuse.
+// the closed buffer across CPUs and judges every flagged source against it:
+//
+//   - heavy over the closed window: confirmed (dropped, with DropHeavy);
+//   - not heavy, but flagged again in the new window: unconfirmed, and kept
+//     to be judged at the end of the new window;
+//   - otherwise: removed.
+//
+// Every candidate is judged whatever epoch its entry carries, because the
+// kernel re-flags a source in place as soon as it crosses the threshold in
+// the new window, which can happen before this code reads the entry. Finally
+// the closed buffer is cleared for reuse.
 func (d *Dataplane) RotateWindow(grace time.Duration) (WindowReport, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -189,6 +199,9 @@ func (d *Dataplane) RotateWindow(grace time.Duration) (WindowReport, error) {
 	d.sk.epoch++
 	if err := d.writeSketchConfig(); err != nil {
 		return WindowReport{}, err
+	}
+	if d.afterFlip != nil {
+		d.afterFlip()
 	}
 	time.Sleep(grace)
 
@@ -211,33 +224,40 @@ func (d *Dataplane) RotateWindow(grace time.Duration) (WindowReport, error) {
 	var key uint32
 	var entry lbHeavyEntry
 	var stale []uint32
-	confirmed := map[uint32]lbHeavyEntry{}
+	updates := map[uint32]lbHeavyEntry{}
 	it := d.objs.Heavy.Iterate()
 	for it.Next(&key, &entry) {
-		if entry.Epoch > closed {
-			continue // flagged in the new window; judged at its end
-		}
+		r.Flagged++
 		est := cm.Estimate(key)
-		if !sketch.IsHeavy(est, cm.Total(), d.sk.minCount, d.sk.phiPPM) {
+		switch {
+		case sketch.IsHeavy(est, cm.Total(), d.sk.minCount, d.sk.phiPPM):
+			entry.Confirmed = 1
+			updates[key] = entry
+			r.Heavy = append(r.Heavy, HeavyHitter{Addr: addrFromKey(key), Estimate: est, Lower: est - min(est, r.Bound)})
+		case entry.Epoch > closed:
+			r.Pending++
+			if entry.Confirmed != 0 {
+				entry.Confirmed = 0
+				updates[key] = entry
+			}
+		default:
 			stale = append(stale, key)
-			continue
 		}
-		entry.Confirmed = 1
-		confirmed[key] = entry
-		r.Heavy = append(r.Heavy, HeavyHitter{Addr: addrFromKey(key), Estimate: est, Lower: est - min(est, r.Bound)})
 	}
 	if err := it.Err(); err != nil {
 		return WindowReport{}, err
 	}
 	// Deleting an entry unblocks its source; confirming one lets the
-	// kernel drop it (when DropHeavy is on) from now until it stops being
-	// heavy over a window.
+	// kernel drop it (when DropHeavy is on) until it stops being heavy over
+	// a window. A kernel flag set between the read above and this delete
+	// (microseconds) is lost; the kernel sets it again at the source's next
+	// packet over the threshold.
 	for _, k := range stale {
 		if err := d.objs.Heavy.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return WindowReport{}, err
 		}
 	}
-	for k, e := range confirmed {
+	for k, e := range updates {
 		if err := d.objs.Heavy.Put(k, e); err != nil {
 			return WindowReport{}, err
 		}

@@ -77,10 +77,10 @@ Traffic-sketch flags:
 Each window the daemon logs one line:
 
 ```text
-sketch: window 1: 1210 packets, 10.0.0.100:5353/udp ≈31 sources (±0.81%); heavy: 10.0.0.250 ≈1000 [1000, 1000]
+sketch: window 1: 1210 packets, 10.0.0.100:5353/udp ≈31 sources (±0.81%); flagged 1 (+0 pending); heavy: 10.0.0.250 ≈1000 [1000, 1000]
 ```
 
-Each heavy hitter is reported as `≈estimate [lower, estimate]`. The true count lies in that interval with probability at least 1−δ.
+`flagged` counts the kernel's candidates judged against the window. `pending` counts those that weren't heavy over it but are already flagged in the next window, so they're kept without being dropped. Each heavy hitter is reported as `≈estimate [lower, estimate]`; the true count lies in that interval with probability at least 1−δ.
 
 Backends reply to clients directly (direct server return), so each backend needs the VIP configured locally: on its loopback interface in L2 mode, plus an IP-in-IP tunnel device in IP-in-IP mode. [`scripts/e2e.sh`](scripts/e2e.sh) sets up both.
 
@@ -155,7 +155,7 @@ This catches every source with ≥ φN + min packets, which is proved. Each conf
 
 With `-drop-heavy` the program drops only **confirmed** sources, so a per-CPU false flag never drops traffic. The cost of that safety is that mitigation starts up to one window late.
 
-**Cost:** the sketches add about 7 ns per packet in `BPF_PROG_TEST_RUN` (57 → 64 ns, one repeated packet, so counters stay in cache). They use 832 KiB per CPU.
+**Cost:** the sketches added 2–12 ns per packet in `BPF_PROG_TEST_RUN` across three runs on two machines: 57–62 → 64 ns on arm64, and 59 → 71 ns on an x86-64 CI runner. That's one repeated packet, so the counters stay in cache. They use 832 KiB per CPU.
 
 ## What was run and what wasn't
 
@@ -169,9 +169,9 @@ Run, all passing:
   - connection tracking: when a 6th backend is added, the table alone would move 511 of 3,000 established flows, and with connection tracking 0 moved;
   - dropping traffic for a VIP with no backends, deleting a VIP, and keeping separate VIP tables apart;
   - the sketches, bit for bit: after 30,000 packets to two VIPs, all 20,480 merged Count-Min counters and both VIPs' 16,384 HyperLogLog registers equal the Go reference;
-  - a 200,000-packet mixed flood across 14 CPUs: the kernel flagged 20 sources (precision 0.65, recall 1.0), and confirmation kept 13 (**precision 1.0, recall 1.0**). Every reported `[â − εN, â]` contained the true count;
+  - a 200,000-packet mixed flood across 14 CPUs: the kernel flagged 20–21 sources (precision 0.62–0.65, recall 1.0; it varies with which CPU each packet lands on), and confirmation kept 13 (**precision 1.0, recall 1.0**, in every run, including on the 4-CPU CI runner). Every reported `[â − εN, â]` contained the true count;
   - drop mode: nothing is dropped before confirmation; after it, 200/200 flood packets are dropped and 100/100 normal ones forwarded. The source is unblocked one quiet window later;
-  - per-packet cost: 57 ns with sketches off, 64 ns on, 65 ns on with the drop check.
+  - per-packet cost: 57–62 ns with sketches off, 64 ns on, 65 ns on with the drop check (two runs). The x86-64 CI runner measured 59, 71 and 76 ns.
 - **`make e2e` in the same VM.** The client, load balancer and three backends each sit in their own network namespace on a Linux bridge, with `maglev-xdp` attached to the load balancer's veth in **generic** XDP mode. The client sends 300 UDP flows, then the backends file gets a fourth backend and the daemon gets a SIGHUP. Then it re-sends the 300 flows, followed by 300 new ones. Results, for both L2 and IP-in-IP:
   - all 900 datagrams arrived in a backend's socket, each on the backend Go predicted;
   - the XDP counters read `tx=900`;
@@ -183,7 +183,7 @@ Run, all passing:
   - the daemon reported the flooder as heavy every window, with the exact count, and never reported a normal source;
   - the distinct-source estimate was ≈31, the true number;
   - all 600 normal datagrams arrived;
-  - restarted with `-drop-heavy`, the flood was cut to between 925 and 1,949 of 3,000 delivered over four runs, the rest dropped in XDP, while all 600 normal datagrams still arrived. The spread comes from how the flood lines up with the 1 s windows: a flood that starts late in a window stays under the floor there, so confirmation waits for the next full window.
+  - restarted with `-drop-heavy`, the flood was cut to 931–1,134 of 3,000 delivered over ten runs (both modes), the rest dropped in XDP, while all 600 normal datagrams still arrived every time. What gets through is the flood's first window, before it is confirmed.
 - **GitHub Actions** (`ubuntu-latest`, x86-64), on every push:
   - gofmt, vet and `go test -race` on Go 1.25 and the current release;
   - the XDP program rebuilt with Ubuntu's clang, with a check that the generated Go bindings match the committed ones;
@@ -195,7 +195,7 @@ Not run:
 
 - **Native (driver-mode) XDP and physical NICs.** The end-to-end test uses generic XDP on veth, which runs the same program but in the kernel's slower generic path. Real performance needs real NICs.
 - **TCP end to end.** The kernel unit tests cover TCP; the veth test only sends UDP.
-- **Any throughput or latency measurement.** That's phase 3. The +7 ns sketch cost is program time with hot caches, not a throughput number.
+- **Any throughput or latency measurement.** That's phase 3. The 2–12 ns sketch cost is program time with hot caches, not a throughput number.
 - **Sketches on real traffic.** The accuracy numbers come from synthetic Zipf traffic and test floods.
 
 ## Known limitations

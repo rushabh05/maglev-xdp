@@ -154,15 +154,18 @@ func run() error {
 
 // logWindow prints one line per window, for example
 //
-//	sketch: window 12: 48210 packets, 10.0.0.100:80/tcp ≈1532 sources (±0.81%); heavy: 192.0.2.7 ≈20113 [20081, 20113]
+//	sketch: window 12: 48210 packets, 10.0.0.100:80/tcp ≈1532 sources (±0.81%); flagged 3 (+1 pending); heavy: 192.0.2.7 ≈20113 [20081, 20113]
 //
-// where [lower, estimate] holds the true count with probability >= 1-δ.
+// "flagged" counts the kernel's candidates judged against the window and
+// "pending" those kept unconfirmed for the next one; [lower, estimate] holds a
+// heavy hitter's true count with probability >= 1-δ.
 func logWindow(r dataplane.WindowReport, top int) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "sketch: window %d: %d packets", r.Epoch, r.Packets)
 	for _, d := range r.Distinct {
 		fmt.Fprintf(&b, ", %v ≈%.0f sources (±%.2f%%)", d.VIP, d.Estimate, 100*d.StdError)
 	}
+	fmt.Fprintf(&b, "; flagged %d (+%d pending)", r.Flagged, r.Pending)
 	b.WriteString("; heavy:")
 	if len(r.Heavy) == 0 {
 		b.WriteString(" none")

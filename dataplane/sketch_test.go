@@ -294,6 +294,65 @@ func TestDropHeavy(t *testing.T) {
 	}
 }
 
+// Regression test for a race the veth e2e test found: a flood keeps arriving
+// while userspace closes a window, so the kernel re-flags the source in the
+// new window (updating its entry in place) before userspace reads the entry.
+// The source must still be judged against the closed window and confirmed.
+func TestHeavyConfirmedWhenReflaggedDuringRotation(t *testing.T) {
+	d := load(t, Config{Sketch: SketchConfig{Phi: 0.5, MinCount: 20, DropHeavy: true}})
+	mustSetVIP(t, d, webVIP, testBackends(2))
+	rng := rand.New(rand.NewPCG(10, 10))
+	srcs := randomAddrs(rng, 2)
+	flooder, normal := srcs[0], srcs[1]
+	send := func(src netip.Addr, n int) (dropped int) {
+		for range n {
+			if ret, _ := run(t, d, vipPacket(rng, webVIP, src)); ret == xdpDrop {
+				dropped++
+			}
+		}
+		return dropped
+	}
+
+	send(flooder, 300)
+	send(normal, 10)
+	// Between the epoch switch and the judging, the flood continues: enough
+	// packets to cross the per-CPU threshold in the new window.
+	d.afterFlip = func() { send(flooder, 100) }
+	r, err := d.RotateWindow(0)
+	d.afterFlip = nil
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Heavy) != 1 || r.Heavy[0].Addr != flooder {
+		t.Fatalf("heavy = %+v (flagged %d, pending %d), want the flooder confirmed", r.Heavy, r.Flagged, r.Pending)
+	}
+	if dropped := send(flooder, 100); dropped != 100 {
+		t.Errorf("after confirmation, %d of 100 flood packets dropped", dropped)
+	}
+	if dropped := send(normal, 10); dropped != 0 {
+		t.Errorf("%d normal packets dropped", dropped)
+	}
+
+	// A source flagged in the new window but not heavy over the closed one
+	// is kept, unconfirmed (not dropped), and judged next time.
+	quiet := randomAddrs(rng, 3)[2]
+	d.afterFlip = func() { send(quiet, 100) }
+	r, err = d.RotateWindow(0) // closes the window with 200 flood + 10 normal packets
+	d.afterFlip = nil
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Pending != 1 {
+		t.Fatalf("pending = %d, want 1 (the source first flagged in the new window)", r.Pending)
+	}
+	if dropped := send(quiet, 10); dropped != 0 {
+		t.Errorf("an unconfirmed source had %d packets dropped", dropped)
+	}
+	if r, _ = d.RotateWindow(0); len(r.Heavy) != 1 || r.Heavy[0].Addr != quiet {
+		t.Errorf("next window: heavy = %+v, want the newly flagged source", r.Heavy)
+	}
+}
+
 func TestSketchesDisabled(t *testing.T) {
 	d := load(t, Config{Sketch: SketchConfig{Disabled: true, DropHeavy: true, MinCount: 1}})
 	mustSetVIP(t, d, webVIP, testBackends(2))

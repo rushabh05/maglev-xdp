@@ -92,6 +92,8 @@ type Dataplane struct {
 	vips    map[VIP]*vipState
 	nextID  uint32 // backend IDs are never reused; 0 means "none"
 	sk      sketchState
+
+	afterFlip func() // test hook: runs in RotateWindow right after the epoch switch
 }
 
 type vipState struct {

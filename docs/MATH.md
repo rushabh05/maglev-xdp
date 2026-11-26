@@ -244,7 +244,10 @@ The grace period is a practical bound, not a synchronisation guarantee. A progra
 **Definitions.** There are $C$ CPUs. $a_{x,c}$ and $N_c$ are source $x$'s and all packets on CPU $c$ in a window, so $a_x = \sum_c a_{x,c}$ and $N = \sum_c N_c$. The thresholds are a share $\varphi$ and a floor $m_0$; a source is **heavy** if $a_x \ge \max(\varphi N, m_0)$. Detection has two stages:
 
 - **Kernel flag**, per CPU, on each packet from $x$: flag $x$ if $\hat a_{x,c} \ge \max(\varphi N_c, \lceil m_0/C\rceil)$, using CPU $c$'s own sketch and counts so far.
-- **Userspace confirmation**, once per window, on the merged sketch: confirm a flagged $x$ if $\hat a_x \ge \max(\varphi N, m_0)$. Unconfirmed entries are removed.
+- **Userspace confirmation**, at the end of each window, on that window's merged sketch. Every flagged $x$ is judged:
+  - confirmed if $\hat a_x \ge \max(\varphi N, m_0)$;
+  - otherwise kept, but unconfirmed, if the kernel has already flagged it again in the new window;
+  - otherwise removed.
 
 ### 5.1 Recall: everything clearly heavy is caught (proved)
 
@@ -259,6 +262,11 @@ a_{x,c} \le \hat a_{x,c}(t_c) < \max\big(\varphi N_c(t_c),\, \lceil m_0/C\rceil\
 Both $N_c(t_c) \le N_c$ and the integrality of $a_{x,c}$ (so $a_{x,c} < \lceil m_0/C\rceil$ implies $a_{x,c} < m_0/C$) then give $a_{x,c} < \varphi N_c + m_0/C$. The same inequality holds trivially on CPUs with $a_{x,c} = 0$. Summing over all $C$ CPUs gives $a_x < \varphi N + m_0$, a contradiction. So $x$ is flagged. It is then confirmed, because $\hat a_x \ge a_x \ge \varphi N + m_0 \ge \max(\varphi N, m_0)$. $\blacksquare$
 
 The per-CPU floor is $\lceil m_0/C\rceil$ rather than $m_0$ for exactly this reason. With $m_0$ on every CPU, a source spread over many CPUs never reaches the floor on any one of them. An earlier version did that, and its measured recall at 16 CPUs was 0.69. Sources with $\max(\varphi N, m_0) \le a_x < \varphi N + m_0$ are heavy but not guaranteed to be caught. The tables below report measured recall on them.
+
+**Implementation notes.** Two points about the implementation, both of which the proof relies on:
+
+- *Every candidate is judged, whatever epoch its entry carries.* The kernel re-flags a source in place as soon as it crosses the threshold in a new window. Under a sustained flood that happens within milliseconds of the switch, before userspace reads the entry. An earlier version judged only entries whose epoch matched the closed window, so a continuous flood was never confirmed. The veth end-to-end test caught it, and `TestHeavyConfirmedWhenReflaggedDuringRotation` now reproduces it deterministically.
+- *There is one race left.* A flag the kernel sets between userspace reading an entry and deleting it, a window of microseconds, is lost. The kernel sets it again at the source's next packet over the threshold, so this only matters if that was the source's last such packet in the window.
 
 ### 5.2 Precision: confirmed sources are nearly heavy (proved)
 
@@ -294,11 +302,13 @@ If a source sends at least $\varphi N + m_0$ packets in a window, §5.1 says it 
 
 **Kernel.** `TestHeavyHittersInKernel` ran the real XDP program (`BPF_PROG_TEST_RUN`, 14 CPUs) on $N = 200{,}000$ packets. 66% came from 20,000 Zipf($s=1.1$) sources and the rest from the same ten attackers. It used $m_0 = 200$ (15 per CPU), and $\varepsilon N = 132$:
 
-- the kernel flagged 20 sources, for precision 0.65 and recall 1.0;
-- confirmation kept 13, for **precision 1.0 and recall 1.0**;
+- the kernel flagged 20–21 sources over several runs, for precision 0.62–0.65 and recall 1.0. Which CPU runs each test packet varies, so the per-CPU flags vary too; the 4-CPU CI runner flagged 17, for precision 0.77;
+- confirmation kept 13, for **precision 1.0 and recall 1.0**, in every run;
 - every reported interval $[\hat a - \lfloor\varepsilon N\rfloor, \hat a]$ contained the true count.
 
-**Drop mode.** `TestDropHeavy` passed 0 of 200 flood packets in the window before confirmation, then dropped **200 of 200** while forwarding **100 of 100** normal packets. The end-to-end test ran 30 normal sources plus one flooder at 1000 packets/s for 3 s over veth. Across four runs (both forwarding modes), the backends received **600 of 600** normal datagrams every time. The flood was cut to between 925 and 1,949 delivered out of 3,000, with the rest dropped in XDP. That matches §5.3: drops start once a full window confirms the flooder, so up to about two windows' worth gets through, depending on where the flood starts within a window.
+**Drop mode.** `TestDropHeavy` passed 0 of 200 flood packets in the window before confirmation, then dropped **200 of 200** while forwarding **100 of 100** normal packets. The end-to-end test ran 30 normal sources plus one flooder at 1000 packets/s for 3 s over veth. Across ten runs (both forwarding modes), the backends received **600 of 600** normal datagrams every time. The flooder was confirmed at the end of its first window in every run, and the flood was cut to 931–1,134 of 3,000 delivered, with the rest dropped in XDP. That matches §5.3: what gets through is the flood's first window, before confirmation.
+
+Before the re-flag fix in §5.1, some runs let 1,920–2,936 through, because a continuous flood could stay unconfirmed for several windows.
 
 ---
 
@@ -324,13 +334,15 @@ The heavy-hitter map is shared across CPUs: 1,024 entries of 16 B.
 
 There are no atomic operations and no loops beyond the five unrolled rows.
 
-**Measured.** `TestPerPacketCost` repeats one VIP packet $2\times10^6$ times through `BPF_PROG_TEST_RUN` and reports the best of 5 runs (Docker Desktop's Linux VM, Apple M4 Pro):
+**Measured.** `TestPerPacketCost` repeats one VIP packet $2\times10^6$ times through `BPF_PROG_TEST_RUN` and reports the best of 5 repetitions. It ran three times on two machines; each column is one test run:
 
-| configuration | ns per packet |
-|---|---:|
-| sketches off | 57 |
-| sketches on | 64 (**+7**) |
-| sketches on, drop check on | 65 (+8) |
+| configuration | Docker VM, Apple M4 Pro (arm64), run 1 | same, run 2 | GitHub Actions runner (x86-64) |
+|---|---:|---:|---:|
+| sketches off | 57 ns | 62 ns | 59 ns |
+| sketches on | 64 ns (+7) | 64 ns (+2) | 71 ns (+12) |
+| sketches on, drop check on | 65 ns (+8) | 65 ns (+3) | 76 ns (+17) |
+
+So the sketches added **2–12 ns per packet** in these runs, and 3–17 ns with the drop check. On arm64 the run-to-run spread of the baseline is as large as the effect, so read this as "a few to about a dozen nanoseconds", not a precise figure.
 
 This is in-kernel program time with the counters hot in cache, because the same packet repeats. It leaves out driver and NIC costs and the cache misses that many distinct sources would cause. So it bounds what the sketches add in the best case. It is not a throughput figure.
 
